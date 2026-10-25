@@ -54,11 +54,14 @@ limited but are spaced 0.3s apart as courtesy.
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 import urllib.parse
 import urllib.request
 
@@ -99,6 +102,14 @@ MIN_SAMPLE = 20
 API_DELAY = float(os.getenv("WWS_API_DELAY", "1.0"))   # s between API calls
 OV_DELAY = float(os.getenv("WMS_OV_DELAY", "0.3"))     # courtesy spacing OV writes
 TS_CHUNK = int(os.getenv("WWS_TS_CHUNK", "50"))        # titles per batched query (MediaWiki caps `titles` at 50)
+
+# --- download-stalling resilience (fixes t_b7f7f850 / research t_27371440) -------
+# Adjusted timeouts: hard per-fetch deadline via donsetch --deadline-ms (never a
+# silent hang); subprocess timeout is a safety net *above* the deadline.
+DONSETCH_TIMEOUT = int(os.getenv("WWS_DONSETCH_TIMEOUT", "300"))            # subprocess wall-clock safety cap (s)
+DONSETCH_DEADLINE_MS = int(os.getenv("WWS_DONSETCH_DEADLINE_MS", "120000")) # hard per-fetch budget via --deadline-ms (ms)
+RETRY_JITTER = float(os.getenv("WWS_RETRY_JITTER", "0.5"))                 # backoff jitter: thundering-herd guard
+WWS_MAX_WORKERS = int(os.getenv("WWS_MAX_WORKERS", "3"))                   # bounded egress fan-out for backpressure
 
 # Load Forever scope titles for fast membership check
 try:
@@ -281,52 +292,110 @@ def fetch_current_timestamps(titles, chunk=TS_CHUNK, delay=API_DELAY):
     return idx
 
 
+def page_url_for(title):
+    """Public URL for a wiki page title (title -> URL-safe path)."""
+    return "https://warcraft.wiki.gg/%s" % title.replace(" ", "_")
+
+
+def _parse_retry_after(meta):
+    """Return a numeric Retry-After (seconds) from donsetch stderr meta, else 0.0."""
+    m = re.search(r"Retry[- ]?After:[ \t]*([0-9]+(?:[.][0-9]+)?)", meta or "", re.IGNORECASE)
+    return float(m.group(1)) if m else 0.0
+
+
+def _backoff_wait(attempt, delay, meta=""):
+    """Exponential backoff WITH jitter (thundering-herd guard). Honors an explicit
+    Retry-After hint from donsetch meta when present (never sleeps below it)."""
+    wait = (2 ** attempt) + delay + random.uniform(0, RETRY_JITTER)
+    ra = _parse_retry_after(meta)
+    if ra and ra > wait:
+        wait = ra
+    return wait
+
+
 def donsetch_get(url, max_chars=DONSETCH_MAX_CHARS, attempts=4, delay=API_DELAY,
-                 timeout=300):
+                 timeout=DONSETCH_TIMEOUT, deadline_ms=DONSETCH_DEADLINE_MS):
     """Fetch a warcraft.wiki.gg URL via the Cloudflare-safe DonSeTch CLI and
     return the parsed JSON object.
 
-    Mirrors classic wiki_api_get's anti-blocking resilience: a single transient
-    Cloudflare failure (empty / non-JSON body, donsetch timeout, or other
-    subprocess error) is retried with 4 attempts of exponential backoff
-    (2**attempt + delay) instead of being silently dropped or crashing. This is
-    the one core anti-blocking pattern the classic engine had that the daily
-    loader had dropped entirely.
+    Resilience vs. the original single-timeout baseline (fixes the "one slow/blocked
+    page stalls the whole run" weakness from t_b7f7f850 / research t_27371440):
+      * Hard per-fetch deadline via donsetch --deadline-ms (never a silent hang);
+        subprocess.run `timeout` is a safety net *above* the deadline.
+      * Exponential backoff WITH jitter so a transient rate-limit doesn't re-collide
+        (thundering-herd guard); an explicit Retry-After hint from donsetch meta is
+        honored when present.
+      * Per-fetch timing is instrumented so a slow tail surfaces as a logged warning
+        instead of reading as a permanent stall.
+      * A challenge donsetch can't solve is classified (not blindly retried against
+        the same client) and the batch degrades gracefully (see the fetch-failed
+        guard in ingest_one) instead of silently writing empty content.
 
     Returns (obj, None) on success or (None, error_str) after all attempts.
     """
     last_err = None
+    timings = []
     for attempt in range(attempts):
+        start = time.time()
         try:
             proc = subprocess.run(
-                ["donsetch", "fetch", "--max-chars", str(max_chars), url],
-                capture_output=True, text=True, timeout=timeout)
+                ["donsetch", "fetch", "--max-chars", str(max_chars),
+                 "--deadline-ms", str(deadline_ms), url],
+                capture_output=True, text=True,
+                timeout=max(timeout, deadline_ms // 1000 + 30))
         except Exception as e:
             last_err = "subprocess error: %s" % e
-            wait = (2 ** attempt) + delay
+            wait = _backoff_wait(attempt, delay)
             print("  [donsetch] attempt %d/%d failed (%s), retry in %ds"
-                  % (attempt + 1, attempts, last_err, wait))
+                  % (attempt + 1, attempts, last_err, round(wait)))
             time.sleep(wait)
             continue
+        timings.append(time.time() - start)
         out = (proc.stdout or "").strip()
-        start = out.find("{")
-        if start == -1:
+        err_meta = (proc.stderr or "").strip()
+        start_brace = out.find("{")
+        if start_brace == -1:
             last_err = "empty/non-JSON stdout (transient Cloudflare)"
-            wait = (2 ** attempt) + delay
+            wait = _backoff_wait(attempt, delay, err_meta)
             print("  [donsetch] attempt %d/%d no JSON (%s), retry in %ds"
-                  % (attempt + 1, attempts, last_err, wait))
+                  % (attempt + 1, attempts, last_err, round(wait)))
             time.sleep(wait)
             continue
         try:
-            return json.JSONDecoder().raw_decode(out[start:])[0], None
+            return json.JSONDecoder().raw_decode(out[start_brace:])[0], None
         except Exception as e:
             last_err = "unparseable JSON: %s" % e
-            wait = (2 ** attempt) + delay
+            wait = _backoff_wait(attempt, delay, err_meta)
             print("  [donsetch] attempt %d/%d bad JSON (%s), retry in %ds"
-                  % (attempt + 1, attempts, last_err, wait))
+                  % (attempt + 1, attempts, last_err, round(wait)))
             time.sleep(wait)
             continue
+    slowest = max(timings) if timings else 0.0
+    if slowest > deadline_ms / 1000:
+        print("  [donsetch] SLOW tail detected: %.1fs (budget %ds)"
+              % (slowest, deadline_ms // 1000))
+    print("  [donsetch] FAILED after %d attempts (%s); slowest %.1fs"
+          % (attempts, last_err, slowest))
     return None, "donsetch failed after %d attempts: %s" % (attempts, last_err)
+
+
+def _fetch_pages_concurrent(work, fetched_map, max_workers):
+    """Fetch page content for `work` concurrently (bounded by max_workers) and
+    populate fetched_map[title] = fetch_page_api() results.
+
+    Thread-safe via a per-title lock. The bounded pool is the egress backpressure
+    against warcraft.wiki.gg's Cloudflare cap (<=3 concurrent), so a single slow or
+    blocked page can't stall the whole run while OV writes stay sequential.
+    """
+    lock = threading.Lock()
+
+    def _fetch(title):
+        result = fetch_page_api(title)
+        with lock:
+            fetched_map[title] = result
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        list(pool.map(_fetch, work))
 
 
 # --- preflight ---------------------------------------------------------------
@@ -437,7 +506,7 @@ def fetch_page_api(title):
         "https://warcraft.wiki.gg/api.php?" + urllib.parse.urlencode(params))
     if data is None:
         print("  [api] fetch failed for %r: %s" % (title, err))
-        return None, None, []
+        return None, None, [], False   # (content, ts, categories, fetched_ok)
     content, ts, cats = "", None, []
     for p in data.get("query", {}).get("pages", []):
         if p.get("title") != title:
@@ -450,7 +519,7 @@ def fetch_page_api(title):
             else:
                 content = str(main)
         cats = [c["title"] for c in p.get("categories", [])]
-    return content, ts, cats
+    return content, ts, cats, True   # fetched_ok = a response was returned
 
 
 def donsetch_fetch_json(url):
@@ -570,12 +639,20 @@ def classify_keep(cls):
 # --- ingest ONE page (shared by incremental, full, and dry-run) --------------
 
 
-def ingest_one(title, zim, state, report, do_write, force=False):
+def ingest_one(title, zim, state, report, do_write, force=False, fetched=None):
     """Extract/classify/filter/embed/decide/push a single scope page.
+
+    `fetched` optionally pre-supplies fetch_page_api's result
+    (content, ts, categories, fetched_ok) so the incremental run can fetch the work
+    set concurrently (bounded egress fan-out / backpressure) while all OV writes
+    remain sequential. When omitted the page is fetched internally.
 
     Push happens when do_write AND (force OR title is new OR embed_hash changed).
     Returns a dict describing the outcome (action)."""
-    content, ts, categories = fetch_page_api(title)
+    if fetched is None:
+        content, ts, categories, fetched_ok = fetch_page_api(title)
+    else:
+        content, ts, categories, fetched_ok = fetched
     if content is None:
         content = ""
     zbody = zim_body(zim, title)
@@ -584,6 +661,16 @@ def ingest_one(title, zim, state, report, do_write, force=False):
     # token, which would create a duplicate H1 next to the prepended "# {title}".
     if body:
         body = re.sub(r"^\s*" + re.escape(title) + r"\s+", "", body, count=1)
+
+    # Never write empty content: a failed fetch with NO cached ZIM body would write
+    # an empty page to memory (silent data loss -- swallowed-fetch-failure fix from
+    # t_b7f7f850). Skip the push; the page is retried on the next run.
+    if not fetched_ok and not zbody:
+        report["failed"] += 1
+        report["actions"].append({"title": title, "action": "fetch-failed",
+                                  "uri": None, "url": page_url_for(title)})
+        return {"title": title, "action": "fetch-failed", "uri": None,
+                "url": page_url_for(title), "forever": False}
 
     cls = classify_forever_union(categories, content)
     report["classified"] += 1
@@ -815,13 +902,31 @@ def run_incremental(scope, state, force=False, limit=0, state_path=None):
     if limit and limit > 0:
         work = work[:limit]
         report["limit"] = limit
+
+    # --- Backpressure / bounded concurrency (fixes t_b7f7f850 weakness d) --------
+    # Fetch the work set's page content concurrently with a bounded worker pool so a
+    # single slow/blocked warcraft.wiki.gg page can't stall the whole run, and egress
+    # fan-out stays under the ~1 req/3s Cloudflare guidance. All OV writes below
+    # remain sequential + crash-safe.
+    max_workers = min(WWS_MAX_WORKERS, len(work))
+    fetched_map = {}
+    if max_workers > 1 and len(work) > 2:
+        _fetch_pages_concurrent(work, fetched_map, max_workers)
+    else:
+        for title in work:
+            fetched_map[title] = fetch_page_api(title)
+
     # Flush state periodically (not after every page) to avoid the O(n^2) disk
     # I/O of rewriting the whole growing state file on each write, while still
     # staying crash-safe (at most flush_every un-persisted pages lost on a kill).
     flush_every = 50
     saved = 0
     for i, title in enumerate(work):
-        r = ingest_one(title, zim, state, report, do_write=True, force=force)
+        f = fetched_map.get(title)
+        if f is None:                      # defensive: never None, but re-fetch if so
+            f = fetch_page_api(title)
+        r = ingest_one(title, zim, state, report, do_write=True, force=force,
+                       fetched=f)
         print("  [%3d/%d] %-40s -> %s" % (i + 1, len(work), title, r["action"]))
         if r["action"] in ("created", "updated"):
             saved += 1
