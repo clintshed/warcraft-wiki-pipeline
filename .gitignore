@@ -1,0 +1,17 @@
+# Runtime data / state (NOT source)
+warcraft_wiki_state.json
+warcraft_wiki_ingest_state.json
+warcraft_wiki_embeddings.jsonl
+warcraft_wiki_zim_cache.json
+warcraft_wiki_ingest_report.json
+warcraft_wiking_dryrun_report.json
+warcraft_wiki_incremental_plan.json
+warcraft_wiki_changes.log
+warcraft_wiki_monitor_snapshot.json
+
+# Bytecode
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
